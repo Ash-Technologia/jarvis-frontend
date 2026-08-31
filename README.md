@@ -2,7 +2,7 @@
 
 The frontend is a React 19 + Vite application. It provides the futuristic cyberpunk HUD interface, voice orb animation, microphone audio capture, SpeechSynthesis/Edge TTS playback, safe web navigation confirmation, and movable panels.
 
-## Prerequisites
+## Prerequisite
 
 - Node.js 20 or newer
 - On Day 2: The Jarvis backend running at `http://127.0.0.1:8765`
