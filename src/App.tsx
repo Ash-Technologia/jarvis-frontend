@@ -3,15 +3,22 @@ import { sendChatMessage } from "./api/chat";
 import { fetchVoices, requestSpeech, transcribeRecording, Voice } from "./api/speech";
 import { AmbientHud } from "./components/AmbientHud";
 import { ActivityMonitor } from "./components/ActivityMonitor";
+import { ArcReactorDiagnostics } from "./components/ArcReactorDiagnostics";
+import { TacticalRadar } from "./components/TacticalRadar";
+import { QuickCommandDeck } from "./components/QuickCommandDeck";
+import { ArmorDiagnostics } from "./components/ArmorDiagnostics";
+import { MemoryVaultHUD } from "./components/MemoryVaultHUD";
+import { TopHudBar } from "./components/TopHudBar";
 import { ComponentState, SystemStatus } from "./components/SystemStatus";
 import { BriefingPanel } from "./components/BriefingPanel";
-import { MovablePanel } from "./components/MovablePanel";
 import { OrbControl } from "./components/OrbControl";
 import { waitForBackend } from "./api/system";
 import { isWebActionRequest, planWebAction, WebAction } from "./webActions";
 import { executeLocalAction, getLocalActionStatus, isLocalActionRequest, LocalAction, planLocalAction } from "./localActions";
 import { DEMO_MODE } from "./config/mode";
-import cyberpunkBackgroundVideo from "./assets/cyberpunk-background.mp4";
+import { sfx } from "./utils/sfx";
+import { WakeWordListener } from "./utils/wakeWord";
+import cyberpunkBackgroundVideo from "./assets/Animate_background_for_web_inter…_202609011657.mp4";
 
 type Message = { author: "user" | "jarvis"; text: string };
 type Status = "idle" | "listening" | "thinking" | "speaking" | "error";
@@ -19,20 +26,7 @@ type PendingAction =
   | { type: "web"; action: WebAction }
   | { type: "local"; action: LocalAction };
 
-function defaultPanelPositions() {
-  const viewportWidth = window.innerWidth;
-  const viewportHeight = window.innerHeight;
-  return {
-    activity: { x: 34, y: 118 },
-    briefing: { x: 34, y: Math.max(490, viewportHeight - 268) },
-    chat: { x: Math.max(360, viewportWidth - 404), y: Math.max(72, Math.round((viewportHeight - 540) / 2)) },
-    orb: { x: Math.round((viewportWidth - 180) / 2), y: Math.round((viewportHeight - 180) / 2) },
-    status: { x: 34, y: 292 },
-  };
-}
-
 export function App() {
-  const panelPositions = useRef(defaultPanelPositions());
   const sessionId = useRef(crypto.randomUUID());
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
@@ -42,6 +36,8 @@ export function App() {
   const animationRef = useRef<number | null>(null);
   const recordingStartedAtRef = useRef(0);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const wakeWordRef = useRef<WakeWordListener | null>(null);
+
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [status, setStatus] = useState<Status>("idle");
@@ -58,89 +54,135 @@ export function App() {
   const [localActionsState, setLocalActionsState] = useState<ComponentState>("unknown");
   const [localActionsEnabled, setLocalActionsEnabled] = useState(false);
   const [networkState, setNetworkState] = useState<ComponentState>(() => (navigator.onLine ? "ready" : "error"));
-  const [bluetoothState] = useState<ComponentState>(() => ("bluetooth" in navigator ? "ready" : "unknown"));
+  const [bluetoothState, setBluetoothState] = useState<ComponentState>(() => ("bluetooth" in navigator ? "ready" : "unknown"));
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-    void (async () => {
+    messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    const handleOnline = () => setNetworkState("ready");
+    const handleOffline = () => setNetworkState("error");
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      setMicrophoneState("error");
+      return;
+    }
+    navigator.mediaDevices
+      .enumerateDevices()
+      .then((devices) => {
+        const hasMic = devices.some((device) => device.kind === "audioinput");
+        setMicrophoneState(hasMic ? "ready" : "error");
+      })
+      .catch(() => setMicrophoneState("error"));
+  }, []);
+
+  useEffect(() => {
+    let unmounted = false;
+    async function loadVoices() {
+      try {
+        const available = await fetchVoices();
+        if (unmounted) return;
+        setVoices(available);
+        if (available.length) setVoiceId(available[0].id);
+        setTtsState("ready");
+      } catch {
+        if (!unmounted) setTtsState("error");
+      }
+    }
+    void loadVoices();
+    return () => {
+      unmounted = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let unmounted = false;
+    async function initBackend() {
       if (DEMO_MODE) {
         setBackendState("ready");
         setBackendStarting(false);
-        setChatState("ready");
+        setSttState("ready");
         setTtsState("ready");
-        const items = await fetchVoices();
-        if (!cancelled) {
-          setVoices(items);
-          setVoiceId(items[0]?.id ?? "demo-guy");
-        }
+        setChatState("ready");
+        setLocalActionsState("unknown");
         return;
       }
-
-      const healthy = await waitForBackend();
-      if (cancelled) return;
-      setBackendState(healthy ? "ready" : "error");
-      setBackendStarting(false);
-      if (!healthy) {
-        setError("Jarvis backend did not start. Restart the app and try again.");
-        return;
+      setBackendStarting(true);
+      const isReady = await waitForBackend();
+      if (unmounted) return;
+      if (isReady) {
+        setBackendState("ready");
+        setBackendStarting(false);
+        setSttState("ready");
+        setTtsState("ready");
+        setChatState("ready");
+        const localStatus = await getLocalActionStatus().catch(() => false);
+        if (unmounted) return;
+        setLocalActionsEnabled(localStatus);
+        setLocalActionsState(localStatus ? "ready" : "unknown");
+      } else {
+        setBackendState("error");
+        setBackendStarting(false);
+        setSttState("error");
+        setTtsState("error");
+        setChatState("error");
+        setLocalActionsState("error");
       }
-      const voiceRequest = fetchVoices();
-      const localActionsRequest = getLocalActionStatus();
-      try {
-        const items = await voiceRequest;
-        if (cancelled) return;
-        setVoices(items);
-        if (!items.some((item) => item.id === voiceId)) setVoiceId(items[0]?.id ?? voiceId);
-      } catch {
-        if (!cancelled) setError("Voice options are unavailable. Text chat still works.");
-      }
-      try {
-        const enabled = await localActionsRequest;
-        if (cancelled) return;
-        setLocalActionsEnabled(enabled);
-        setLocalActionsState(enabled ? "ready" : "unknown");
-      } catch {
-        if (!cancelled) setLocalActionsState("error");
-      }
-    })();
+    }
+    void initBackend();
     return () => {
-      cancelled = true;
+      unmounted = true;
     };
   }, []);
 
+  // Initialize Continuous Wake Word Engine ("Hey Jarvis")
   useEffect(() => {
-    const updateNetwork = () => setNetworkState(navigator.onLine ? "ready" : "error");
-    window.addEventListener("online", updateNetwork);
-    window.addEventListener("offline", updateNetwork);
+    wakeWordRef.current = new WakeWordListener((command) => {
+      sfx.playPowerUp();
+      if (command && command.trim().length > 1) {
+        void askJarvis(command.trim());
+      } else {
+        // User said "Hey Jarvis" - automatically open microphone stream to record command!
+        void startListening();
+      }
+    });
+
+    wakeWordRef.current.start();
     return () => {
-      window.removeEventListener("online", updateNetwork);
-      window.removeEventListener("offline", updateNetwork);
+      wakeWordRef.current?.stop();
     };
   }, []);
-
-  useEffect(() => () => {
-    stopSpeech();
-    stopCapture();
-  }, []);
-
-  useEffect(() => {
-    requestAnimationFrame(() => messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" }));
-  }, [messages, status, pendingAction]);
 
   function stopSpeech() {
-    if (DEMO_MODE && "speechSynthesis" in window) {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      audioRef.current = null;
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+    }
+    if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }
-    audioRef.current?.pause();
-    audioRef.current = null;
-    if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    audioUrlRef.current = null;
   }
 
   function stopCapture() {
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    animationRef.current = null;
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     void audioContextRef.current?.close();
@@ -194,6 +236,7 @@ export function App() {
   }
 
   async function askJarvis(text: string) {
+    sfx.playChirp();
     stopSpeech();
     setError("");
     setPendingAction(null);
@@ -270,6 +313,7 @@ export function App() {
 
   async function confirmAction() {
     if (!pendingAction) return;
+    sfx.playLaser();
     const currentAction = pendingAction;
     setPendingAction(null);
 
@@ -299,6 +343,7 @@ export function App() {
   }
 
   function cancelAction() {
+    sfx.playBeep(400, 0.1);
     setPendingAction(null);
     const reply = "Action cancelled.";
     setMessages((current) => [...current, { author: "jarvis", text: reply }]);
@@ -315,6 +360,7 @@ export function App() {
 
   async function startListening() {
     if (status === "thinking" || backendStarting || recorderRef.current) return;
+    sfx.playBeep(880, 0.05);
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setError("This browser does not support microphone recording. Text chat remains available.");
       return;
@@ -332,11 +378,12 @@ export function App() {
       const analyser = context.createAnalyser();
       analyser.fftSize = 256;
       context.createMediaStreamSource(stream).connect(analyser);
-      const samples = new Uint8Array(analyser.fftSize);
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
       const updateMeter = () => {
-        analyser.getByteTimeDomainData(samples);
-        const mean = samples.reduce((sum, sample) => sum + Math.abs(sample - 128), 0) / samples.length;
-        setLevel(Math.min(1, mean / 26));
+        analyser.getByteFrequencyData(dataArray);
+        const sum = dataArray.reduce((acc, curr) => acc + curr, 0);
+        const average = sum / dataArray.length;
+        setLevel(Math.min(1, average / 80));
         animationRef.current = requestAnimationFrame(updateMeter);
       };
       updateMeter();
@@ -352,7 +399,7 @@ export function App() {
         const duration = performance.now() - recordingStartedAtRef.current;
         stopCapture();
         if (duration < 650) {
-          setError("Recording was too short. Hold the button while speaking, then release.");
+          setError("Recording was too brief. Say 'Hey Jarvis' or click to speak.");
           setSttState("error");
           setStatus("error");
           return;
@@ -407,12 +454,12 @@ export function App() {
   const stateLabel = backendStarting
     ? "STARTING LOCAL BACKEND"
     : status === "listening"
-    ? "LISTENING / HOLD TO TALK"
+    ? "LISTENING / TAP OR SPEAK"
     : status === "thinking"
-    ? "PROCESSING REQUEST"
+    ? "PROCESSING COMMAND"
     : status === "speaking"
     ? "VOICE OUTPUT ACTIVE"
-    : "SYSTEM ONLINE";
+    : "🎙️ 'HEY JARVIS' ARMED & READY";
 
   const statusItems = [
     { label: "BACKEND", state: backendState, detail: DEMO_MODE ? "DEMO MODE" : backendState === "ready" ? "ONLINE" : undefined },
@@ -431,106 +478,131 @@ export function App() {
         <source src={cyberpunkBackgroundVideo} type="video/mp4" />
       </video>
       <AmbientHud active={active} level={status === "listening" ? level : status === "speaking" ? 0.72 : 0.35} />
-      <MovablePanel id="orb" label="Jarvis voice orb" className="orb-panel" defaultPosition={panelPositions.current.orb}>
-        <OrbControl
-          disabled={status === "thinking" || backendStarting}
-          state={status}
-          onStart={() => void startListening()}
-          onStop={finishListening}
-        />
-      </MovablePanel>
-      <MovablePanel id="activity" label="Activity monitor" className="activity-panel" defaultPosition={panelPositions.current.activity}>
-        <ActivityMonitor state={status} />
-      </MovablePanel>
-      <MovablePanel id="system-status" label="System status" className="status-panel" defaultPosition={panelPositions.current.status}>
-        <SystemStatus items={statusItems} />
-      </MovablePanel>
-      <MovablePanel id="briefing" label="Local system briefing" className="briefing-panel-wrapper" defaultPosition={panelPositions.current.briefing}>
-        <BriefingPanel />
-      </MovablePanel>
-      <MovablePanel id="conversation" label="Jarvis conversation" className="chat-panel" defaultPosition={panelPositions.current.chat}>
-        <section className="chat-card" aria-label="Jarvis assistant">
-          <p className="jarvis-brand">JARVIS</p>
-          <h1>At your service.</h1>
-          <p className="connection-state">{stateLabel}</p>
-          <div className="messages" ref={messagesRef} aria-live="polite">
-            {messages.length === 0 && !pendingAction && <p>Type a message or hold to talk.</p>}
-            {messages.map((message, index) => (
-              <p className={`message ${message.author}`} key={`${message.author}-${index}`}>
-                {message.text}
-              </p>
-            ))}
-            {status === "thinking" && <p className="message jarvis">Thinking…</p>}
-            {pendingAction && (
-              <div className="web-action-confirmation" role="alert">
-                {pendingAction.type === "web" ? (
-                  <>
-                    <p>Open {pendingAction.action.label}?</p>
-                    <small>{pendingAction.action.url}</small>
-                  </>
-                ) : (
-                  <>
-                    <p>Launch {pendingAction.action.label}?</p>
-                    <small>Target: {pendingAction.action.appId}</small>
-                  </>
-                )}
-                <div>
-                  <button type="button" onClick={() => void confirmAction()}>
-                    Confirm
-                  </button>
-                  <button type="button" onClick={cancelAction}>
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-          <button
-            className={`talk-button ${status === "listening" ? "is-listening" : ""}`}
-            type="button"
-            onPointerDown={(event) => {
-              event.currentTarget.setPointerCapture(event.pointerId);
-              void startListening();
-            }}
-            onPointerUp={finishListening}
-            onPointerCancel={finishListening}
-            disabled={status === "thinking" || backendStarting}
-          >
-            {status === "listening" ? "Release to send" : backendStarting ? "Starting Jarvis…" : "Hold to talk"}
-          </button>
-          <form onSubmit={handleSubmit} noValidate className="composer">
-            <label className="sr-only" htmlFor="chat-input">
-              Message Jarvis
-            </label>
-            <input
-              id="chat-input"
-              value={input}
-              maxLength={2000}
-              onChange={(event) => setInput(event.target.value)}
-              placeholder="Type a message…"
+
+      {/* FIXED TOP HUD STATUS BAR */}
+      <TopHudBar />
+
+      {/* COCKPIT STRUCTURED 3-COLUMN LAYOUT */}
+      <div className="cockpit-container">
+        {/* LEFT COLUMN: ACTIVITY, SYSTEM METRICS & BRIEFING */}
+        <aside className="cockpit-col-left">
+          <ActivityMonitor state={status} />
+          <SystemStatus items={statusItems} />
+          <BriefingPanel />
+        </aside>
+
+        {/* CENTER COLUMN: TACTICAL RADAR, ORB, COMMAND MATRIX */}
+        <section className="cockpit-col-center">
+          <TacticalRadar />
+          <div className="orb-slot">
+            <OrbControl
               disabled={status === "thinking" || backendStarting}
+              state={status}
+              onStart={() => void startListening()}
+              onStop={finishListening}
             />
-            <button type="submit" disabled={!input.trim() || status === "thinking" || backendStarting}>
-              Send
-            </button>
-          </form>
-          <label className="voice-picker" htmlFor="voice-select">
-            Voice
-            <select id="voice-select" value={voiceId} onChange={(event) => setVoiceId(event.target.value)} disabled={!voices.length}>
-              {voices.map((voice) => (
-                <option key={voice.id} value={voice.id}>
-                  {voice.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          {error && (
-            <p className="error" role="alert">
-              {error}
-            </p>
-          )}
+          </div>
+          <QuickCommandDeck onAskJarvis={(prompt) => void askJarvis(prompt)} />
         </section>
-      </MovablePanel>
+
+        {/* RIGHT COLUMN: AI CONVERSATION, ARC REACTOR, ARMOR & MEMORY */}
+        <aside className="cockpit-col-right">
+          <section className="chat-card" aria-label="Jarvis assistant">
+            <p className="jarvis-brand">J.A.R.V.I.S. MARK VII</p>
+            <h1>Welcome back, Ash.</h1>
+            <p className="connection-state">{stateLabel}</p>
+            <div className="messages" ref={messagesRef} aria-live="polite">
+              {messages.length === 0 && !pendingAction && <p>Systems online. State your command or say "Hey Jarvis".</p>}
+              {messages.map((message, index) => (
+                <p className={`message ${message.author}`} key={`${message.author}-${index}`}>
+                  {message.text}
+                </p>
+              ))}
+              {status === "thinking" && <p className="message jarvis">Thinking…</p>}
+              {pendingAction && (
+                <div className="web-action-confirmation" role="alert">
+                  {pendingAction.type === "web" ? (
+                    <>
+                      <p>Open {pendingAction.action.label}?</p>
+                      <small>{pendingAction.action.url}</small>
+                    </>
+                  ) : (
+                    <>
+                      <p>Launch {pendingAction.action.label}?</p>
+                      <small>Target: {pendingAction.action.appId}</small>
+                    </>
+                  )}
+                  <div>
+                    <button type="button" onClick={() => void confirmAction()}>
+                      Confirm
+                    </button>
+                    <button type="button" onClick={cancelAction}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            <button
+              className={`talk-button ${status === "listening" ? "is-listening" : ""}`}
+              type="button"
+              onClick={() => {
+                if (status === "listening") {
+                  finishListening();
+                } else {
+                  void startListening();
+                }
+              }}
+              disabled={status === "thinking" || backendStarting}
+            >
+              {status === "listening" ? "🎙️ Tap to stop & send" : backendStarting ? "Starting Jarvis…" : "🎙️ Say 'Hey Jarvis' or Tap to Talk"}
+            </button>
+            <form onSubmit={handleSubmit} noValidate className="composer">
+              <label className="sr-only" htmlFor="chat-input">
+                Message Jarvis
+              </label>
+              <input
+                id="chat-input"
+                value={input}
+                maxLength={2000}
+                onChange={(event) => setInput(event.target.value)}
+                placeholder="Type a message for Ash…"
+                disabled={status === "thinking" || backendStarting}
+              />
+              <button type="submit" disabled={!input.trim() || status === "thinking" || backendStarting}>
+                Send
+              </button>
+            </form>
+            <label className="voice-picker" htmlFor="voice-select">
+              Voice Persona
+              <select
+                id="voice-select"
+                value={voiceId}
+                onChange={(event) => {
+                  setVoiceId(event.target.value);
+                  sfx.playBeep(1100, 0.05);
+                }}
+                disabled={!voices.length}
+              >
+                {voices.map((voice) => (
+                  <option key={voice.id} value={voice.id}>
+                    {voice.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {error && (
+              <p className="error" role="alert">
+                {error}
+              </p>
+            )}
+          </section>
+
+          <ArcReactorDiagnostics />
+          <ArmorDiagnostics />
+          <MemoryVaultHUD />
+        </aside>
+      </div>
     </main>
   );
 }
